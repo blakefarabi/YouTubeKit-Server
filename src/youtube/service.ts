@@ -1,7 +1,8 @@
-import { Innertube } from 'youtubei.js';
+import { Innertube, Platform } from 'youtubei.js';
 import { ServerMessage, ServerMessageType, RemoteURLResponse, RemoteURLRequest, RemoteStream } from './models/websocket';
 import { AvailableInnertubeClient } from './models/internal';
 import { fileExtensionFromMimeType } from './file_extension';
+import { evaluateJavaScript } from './js-evaluator';
 
 export class YouTubeService {
    readonly videoID: string;
@@ -91,9 +92,12 @@ export class YouTubeService {
       });
 
       try {
-         // const innertube = await Innertube.create({ fetch: wsFetch });
-         // fix player_id for now (suggested by https://github.com/LuanRT/YouTube.js/issues/1043)
-         const innertube = await Innertube.create({ fetch: wsFetch, player_id: '0004de42' });
+         // Configure JavaScript evaluator for deciphering using QuickJS
+         Platform.shim.eval = async (data, env) => {
+            return await evaluateJavaScript(data, env);
+         };
+
+         const innertube = await Innertube.create({ fetch: wsFetch });
          const streams = await this.getStreams(innertube);
 
          this.send({ type: ServerMessageType.result, content: streams });
@@ -238,7 +242,7 @@ export class YouTubeService {
    // - InnerTube Methods -
 
    private async getStreams(innertube: Innertube): Promise<RemoteStream[]> {
-      const clients: AvailableInnertubeClient[] = ['TV', 'WEB'];
+      const clients: AvailableInnertubeClient[] = ['TV'];
       //   const clients: AvailableInnertubeClient[] = ['WEB_EMBEDDED'];
       let allStreams: RemoteStream[] = [];
 
@@ -262,57 +266,75 @@ export class YouTubeService {
       const f = info.streaming_data || { formats: [], adaptive_formats: [] };
       const formats = [...(f.formats ?? []), ...(f.adaptive_formats ?? [])];
 
-      const allStreams: (RemoteStream | null)[] = formats.map(format => {
-         const streamUrl = format.decipher(innertube.session.player) ?? (format as any).deciphered_url ?? format.url;
+      // Process formats in batches to reduce memory pressure (avoids exceeding 128MB limit)
+      const BATCH_SIZE = 5;
+      const streamsOrNull: (RemoteStream | null)[] = [];
 
-         if (!streamUrl) {
-            return null;
-         }
-
-         if (format.is_dubbed) {
-            console.log('Skip dubbed streams');
-            return null;
-         }
-
-         let mimeType = format.mime_type;
-         let videoCodec: string | undefined = undefined;
-         let audioCodec: string | undefined = undefined;
-
-         if (mimeType?.includes('codecs=')) {
-            const codecString = mimeType.split('codecs=')[1]?.replace(/"/g, '') || '';
-            // Split by comma and potential space
-            const codecs = codecString
-               .split(',')
-               .map(c => c.trim())
-               .filter(c => c.length > 0);
-
-            if (format.has_video && format.has_audio && codecs.length >= 2) {
-               // Assuming the typical order is video, then audio
-               videoCodec = codecs[0];
-               audioCodec = codecs[1];
-            } else if (format.has_video && codecs.length >= 1) {
-               videoCodec = codecs[0];
-            } else if (format.has_audio && codecs.length >= 1) {
-               audioCodec = codecs[0];
+      for (let i = 0; i < formats.length; i += BATCH_SIZE) {
+         const batch = formats.slice(i, i + BATCH_SIZE);
+         const batchResults = await Promise.all(batch.map(async format => {
+            let deciphered: string | undefined;
+            try {
+               deciphered = await format.decipher(innertube.session.player);
+            } catch (error) {
+               console.log('decipher error:', error);
+               deciphered = undefined;
             }
 
-            mimeType = mimeType.split(';')[0]; // remove codec info
-         }
+            const streamUrl = deciphered ?? ((format as any).deciphered_url as string | undefined); // ?? format.url;
 
-         const stream: RemoteStream = {
-            url: streamUrl,
-            itag: format.itag,
-            ext: fileExtensionFromMimeType(mimeType),
-            video_codec: videoCodec,
-            audio_codec: audioCodec,
-            average_bitrate: format.bitrate || undefined,
-            audio_bitrate: format.has_audio ? format.bitrate : undefined,
-            video_bitrate: format.has_video ? format.bitrate : undefined,
-            filesize: format.content_length ? Number(format.content_length) : undefined,
-         };
-         return stream;
-      });
-      const filteredStreams = allStreams.filter(stream => stream !== null);
+            if (!streamUrl) {
+               return null;
+            }
+
+            if (format.is_dubbed) {
+               console.log('Skip dubbed streams');
+               return null;
+            }
+
+            let mimeType = format.mime_type;
+            let videoCodec: string | undefined = undefined;
+            let audioCodec: string | undefined = undefined;
+
+            if (mimeType?.includes('codecs=')) {
+               const codecString = mimeType.split('codecs=')[1]?.replace(/"/g, '') || '';
+               // Split by comma and potential space
+               const codecs = codecString
+                  .split(',')
+                  .map(c => c.trim())
+                  .filter(c => c.length > 0);
+
+               if (format.has_video && format.has_audio && codecs.length >= 2) {
+                  // Assuming the typical order is video, then audio
+                  videoCodec = codecs[0];
+                  audioCodec = codecs[1];
+               } else if (format.has_video && codecs.length >= 1) {
+                  videoCodec = codecs[0];
+               } else if (format.has_audio && codecs.length >= 1) {
+                  audioCodec = codecs[0];
+               }
+
+               mimeType = mimeType.split(';')[0]; // remove codec info
+            }
+
+            const stream: RemoteStream = {
+               url: streamUrl,
+               itag: format.itag,
+               ext: fileExtensionFromMimeType(mimeType),
+               video_codec: videoCodec,
+               audio_codec: audioCodec,
+               average_bitrate: format.bitrate || undefined,
+               audio_bitrate: format.has_audio ? format.bitrate : undefined,
+               video_bitrate: format.has_video ? format.bitrate : undefined,
+               filesize: format.content_length ? Number(format.content_length) : undefined,
+            };
+            return stream;
+         }));
+
+         streamsOrNull.push(...batchResults);
+      }
+
+      const filteredStreams = streamsOrNull.filter((stream): stream is RemoteStream => stream !== null);
 
       return filteredStreams;
    }
