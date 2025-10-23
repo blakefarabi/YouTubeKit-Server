@@ -22,3 +22,7 @@ enabled = true
 
 [env.production]
 name = "youtubekit-server-production"
+
+[[routes]]
+pattern = "fallback.trending.fm"
+custom_domain = true
