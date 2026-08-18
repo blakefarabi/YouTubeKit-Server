@@ -1,6 +1,10 @@
 name = "youtubekit-server"
-main = "src/index.ts"
+main = "src/worker.js"
 compatibility_date = "2025-05-03"
+
+# The quickjs signature solver is no longer used: none of the clients this worker
+# talks to return ciphered URLs, so there is nothing to solve. src/index.ts and the
+# TypeScript sources are left in place for reference.
 
 # Limit CPU execution [in milliseconds]
 [limits]
